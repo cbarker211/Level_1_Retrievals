@@ -311,8 +311,7 @@ class retrieve_conc:
         ax[1].set_title("Second retrieval (with plume mask)")
         
         fig.tight_layout()
-    
-        plt.savefig(f"test_{self.res}.png",dpi=300)
+        plt.savefig(f"./out/{self.site_name}_{self.target_time.strftime('%Y%m%d_%H%M')}_{self.res}.png",dpi=300)
     
     def calc_retrieval(self, target, ref, water_mask, plume_mask):
 
