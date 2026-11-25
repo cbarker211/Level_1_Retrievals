@@ -6,13 +6,13 @@ from haversine import haversine
 import pandas as pd
 import sys
 from datetime import timedelta
-from collections import defaultdict
 
-
-def load_data(site_name, launch_ind, platform):
+def load_data(site_name, launch_ind, platform, center_lat, center_lon):
 
     data_tar, data_ref = load_satellite_data(site_name, launch_ind, platform)
-    time_tar = pd.Timestamp(data_tar["time"].values).round('h')
+    if data_tar is None or data_ref is None:
+        raise ValueError(f"Unsupported platform: {platform}")
+    time_tar = pd.Timestamp(data_tar["time"].values.item()).round('h')
     
     era5_dir = "/home/ucfacb0/ARIA/aria_data_analysis/data/era5"
     filename = os.path.join(era5_dir, f"era5_{site_name}_{time_tar.strftime('%Y%m%d_%H%M')}.nc")
@@ -22,7 +22,7 @@ def load_data(site_name, launch_ind, platform):
     if len(days) > 1:
         print(f"WARNING: time window straddles multiple days: {sorted(days)}")
 
-    era5_data = load_era5_data(filename, data_tar, times_tar)
+    era5_data = load_era5_data(filename, data_tar, times_tar, center_lat, center_lon, platform)
 
     xsc_mean = load_xsc_data()
 
@@ -35,20 +35,26 @@ def load_satellite_data(site_name, launch_ind, platform):
     #####################################################################
 
     # Get data from target file and find launch year.
-    data_dir = "/home/ucfacb0/ARIA/aria_data_download/download"
+    
     if platform == "sn":
-        platformstr = "sentinel-2-l1c-band-l2a-slc"
-        res = 60
+        data_dir = "/home/ucfacb0/ARIA/aria_data_download/download"
+        filestr = f"sentinel-2-l1c-band-l2a-slc-{site_name}-60"
+        file_tar = (f"{data_dir}/{site_name}/{filestr}-tar.nc")
     elif platform == "ls":
-        platformstr = "landsat-8-9-c2-t1-toa"
-        res = 30
-        
-    file_tar = (f"{data_dir}/{site_name}/{platformstr}-{site_name}-{res}-tar.nc")
+        data_dir = "/home/ucfacb0/ARIA/aria_data_download/download"
+        filestr = f"landsat-8-9-c2-t1-toa-{site_name}-30"
+        file_tar = (f"{data_dir}/{site_name}/{filestr}-tar.nc")
+    elif platform == "sd":
+        data_dir = "/home/ucfacb0/uptrop/Data/Satellites/Planet/SuperDove"
+        filestr = f"superdove-8-9-c2-t1-toa-{site_name}"
+        file_tar = (f"{data_dir}/{site_name}/{filestr}-tar-{launch_ind}.nc")
+    else:
+        return None, None
+    
     data_tar = xr.open_dataset(file_tar,decode_timedelta=False)
     target_times = data_tar["time"].values + data_tar["delta_t_secs"].values.astype(int).astype('timedelta64[s]')
     target_times = target_times.astype('datetime64[h]')
     
-
     data_tar = data_tar.isel(time=launch_ind)
     delta_t_secs = data_tar["delta_t_secs"].values
     print(f"Overpass is {delta_t_secs/60:.0f} mins after launch.")
@@ -57,7 +63,10 @@ def load_satellite_data(site_name, launch_ind, platform):
     overpass_time = overpass_time.astype('datetime64[h]')
 
     # Open reference file and remove launch times.
-    file_ref = (f"{data_dir}/{site_name}/{platformstr}-{site_name}-{res}-ref-{str(launch_time)[:4]}.nc")
+    if platform in ["ls","sn"]:
+        file_ref = (f"{data_dir}/{site_name}/{filestr}-ref-{str(launch_time)[:4]}.nc")
+    else:
+        file_ref = (f"{data_dir}/{site_name}/{filestr}-ref-{launch_ind}.nc")
     data_ref = xr.open_dataset(file_ref,decode_timedelta=False)
     ref_times = data_ref["time"].values.astype('datetime64[h]')
     
@@ -72,14 +81,12 @@ def load_satellite_data(site_name, launch_ind, platform):
     
     return data_tar, data_ref
 
-def load_era5_data(filename, data_tar, times_tar):
+def load_era5_data(filename, data_tar, times_tar, center_lat, center_lon, platform):
 
     ##############################################
     # Load the target conditions to index AMF. 
     ##############################################
 
-    center_lat = np.mean(data_tar["lat_range"].values)
-    center_lon = np.mean(data_tar["lon_range"].values)
     delta_t_secs = data_tar["delta_t_secs"].values
     valid_time = 2
     if not os.path.exists(filename):
@@ -104,7 +111,7 @@ def load_era5_data(filename, data_tar, times_tar):
             request.update(extra_dict)
         client = cdsapi.Client()
         result = client.retrieve("reanalysis-era5-single-levels", request)
-        result.download(filename)
+        result.download(filename) # type: ignore
 
     ds_era5_target = xr.open_dataset(filename).isel()
     
@@ -138,12 +145,16 @@ def load_era5_data(filename, data_tar, times_tar):
     print(f"Plume may have travelled by {estimated_distance_10:.1f} km.")
 
     # Launch site is at center, so we need the estimated distance to be smaller than half the box.
-    lat_km = haversine((center_lat, center_lon), (data_tar["lat_range"].values[1], center_lon))
-    lon_km = haversine((center_lat, center_lon), (center_lat, data_tar["lon_range"].values[1]))
+    if platform == "sd":
+        lat_km = (data_tar["y"][0].item()-data_tar["y"][-1].item())/2000
+        lon_km = (data_tar["y"][0].item()-data_tar["y"][-1].item())/2000
+    else:
+        lat_km = haversine((center_lat, center_lon), (center_lon+0.08, center_lon))
+        lon_km = haversine((center_lat, center_lon), (center_lat, center_lat+0.06))
 
     print(f"Grid box is {(lat_km*2):.2f} × {lon_km*2:.2f}")
     if estimated_distance_100 > min([lat_km, lon_km]):
-        print(f"Warning: plume may have travelled outside of the satellite scene (estimated distance: {estimated_distance_100:.1f} km, scene size: {lat_km:.1f} km x {lon_km:.1f} km).")
+        print(f"Warning: plume may have travelled outside of the satellite scene (estimated distance: {estimated_distance_100:.1f} km, scene size (half): {lat_km:.1f} km x {lon_km:.1f} km).")
 
     era5_data = {"h_plume_km": h_plume_km,
                  "sp":         sp,
