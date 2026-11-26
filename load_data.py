@@ -9,24 +9,18 @@ from datetime import timedelta
 
 def load_data(site_name, launch_ind, platform, center_lat, center_lon):
 
-    data_tar, data_ref = load_satellite_data(site_name, launch_ind, platform)
+    data_tar, data_ref, time_tar, time_ref = load_satellite_data(site_name, launch_ind, platform)
     if data_tar is None or data_ref is None:
         raise ValueError(f"Unsupported platform: {platform}")
-    time_tar = pd.Timestamp(data_tar["time"].values.item()).round('h')
     
-    era5_dir = "/home/ucfacb0/ARIA/aria_data_analysis/data/era5"
-    filename = os.path.join(era5_dir, f"era5_{site_name}_{time_tar.strftime('%Y%m%d_%H%M')}.nc")
-
-    times_tar = [time_tar-timedelta(hours=2), time_tar-timedelta(hours=1), time_tar, time_tar+timedelta(hours=1), time_tar+timedelta(hours=2)]
-    days = {(t.year, t.month, t.day) for t in times_tar}
-    if len(days) > 1:
-        print(f"WARNING: time window straddles multiple days: {sorted(days)}")
-
-    era5_data = load_era5_data(filename, data_tar, times_tar, center_lat, center_lon, platform)
+    time_era5 = time_tar.round('h')
+    era5_dir = "/home/ucfacb0/ARIA/Level_1_Retrievals/data/era5"
+    filename = os.path.join(era5_dir, f"era5_{site_name}_{time_era5.strftime('%Y%m%d_%H%M')}.nc")
+    era5_data = load_era5_data(filename, data_tar, time_era5, center_lat, center_lon, platform)
 
     xsc_mean = load_xsc_data()
 
-    return era5_data, xsc_mean, data_tar, data_ref
+    return era5_data, xsc_mean, data_tar, data_ref, time_tar, time_ref
 
 def load_satellite_data(site_name, launch_ind, platform):
 
@@ -49,46 +43,55 @@ def load_satellite_data(site_name, launch_ind, platform):
         filestr = f"superdove-8-9-c2-t1-toa-{site_name}"
         file_tar = (f"{data_dir}/{site_name}/{filestr}-tar-{launch_ind}.nc")
     else:
-        return None, None
+        raise ValueError(f"Unsupported platform: {platform}")
     
     data_tar = xr.open_dataset(file_tar,decode_timedelta=False)
-    target_times = data_tar["time"].values + data_tar["delta_t_secs"].values.astype(int).astype('timedelta64[s]')
-    target_times = target_times.astype('datetime64[h]')
     
-    data_tar = data_tar.isel(time=launch_ind)
-    delta_t_secs = data_tar["delta_t_secs"].values
-    print(f"Overpass is {delta_t_secs/60:.0f} mins after launch.")
-    launch_time = data_tar["time"].values
-    overpass_time = launch_time + np.timedelta64(int(delta_t_secs), 's')
-    overpass_time = overpass_time.astype('datetime64[h]')
-
-    # Open reference file and remove launch times.
     if platform in ["ls","sn"]:
+        
+        # Open target file and select launch.
+        target_times = data_tar["time"].values + data_tar["delta_t_secs"].values.astype(int).astype('timedelta64[s]')
+        target_times = target_times.astype('datetime64[h]')
+        data_tar = data_tar.isel(time=launch_ind)
+        
+        # Open reference dataset. 
+        launch_time = data_tar["time"].values
         file_ref = (f"{data_dir}/{site_name}/{filestr}-ref-{str(launch_time)[:4]}.nc")
-    else:
-        file_ref = (f"{data_dir}/{site_name}/{filestr}-ref-{launch_ind}.nc")
-    data_ref = xr.open_dataset(file_ref,decode_timedelta=False)
-    ref_times = data_ref["time"].values.astype('datetime64[h]')
+        data_ref = xr.open_dataset(file_ref,decode_timedelta=False)
+        ref_times = data_ref["time"].values.astype('datetime64[h]')
     
-    ref_launch_ind = np.where(np.isin(ref_times, target_times))[0]
-    data_ref = data_ref.drop_isel(time=ref_launch_ind)
-    print(target_times, data_ref["time"].values)
+        ref_launch_ind = np.where(np.isin(ref_times, target_times))[0]
+        data_ref = data_ref.drop_isel(time=ref_launch_ind)
+        
+    else:
+        
+        # Open reference dataset. 
+        file_ref = (f"{data_dir}/{site_name}/{filestr}-ref-{launch_ind}.nc")
+        data_ref = xr.open_dataset(file_ref,decode_timedelta=False)
+        data_tar = data_tar.isel(time=0)
+    
+    time_tar = pd.Timestamp(data_tar["time"].values.item()) # Overpass acquisiton time
+    time_ref = data_ref["time"].values
+    delta_t_secs = data_tar["delta_t_secs"].item()
+    print(f"Overpass is {delta_t_secs/60:.0f} mins after launch.")
+    # For Landsat and Sentinel, "time" is the launch, so add delta_t_secs
+    if platform != "sd":
+        time_tar    += pd.Timedelta(seconds=float(delta_t_secs))
 
     # Calculate relative azimuth angle
     # https://stcorp.github.io/harp/doc/html/algorithms/derivations/relative_azimuth_angle.html
     delta_phi = (data_tar["saa"] - data_tar["vaa"]) % 360
     data_tar["raa"] = np.abs(delta_phi - 180)
     
-    return data_tar, data_ref
+    return data_tar, data_ref, time_tar, time_ref
 
-def load_era5_data(filename, data_tar, times_tar, center_lat, center_lon, platform):
+def load_era5_data(filename, data_tar, time_era5, center_lat, center_lon, platform):
 
     ##############################################
     # Load the target conditions to index AMF. 
     ##############################################
 
     delta_t_secs = data_tar["delta_t_secs"].values
-    valid_time = 2
     if not os.path.exists(filename):
         extra_dict = {"variable": ["surface_pressure","total_column_ozone",
                                     "10m_u_component_of_wind","10m_v_component_of_wind",
@@ -96,10 +99,10 @@ def load_era5_data(filename, data_tar, times_tar, center_lat, center_lon, platfo
         era5_halfres = 0.125
         request = {
             "product_type": ["reanalysis"],
-            "year" : [times_tar[valid_time].year],
-            "month": [times_tar[valid_time].month],
-            "day"  : [times_tar[valid_time].day],
-            "time" : sorted(t.strftime('%H:%M') for t in times_tar),
+            "year" : [time_era5.year],
+            "month": [time_era5.month],
+            "day"  : [time_era5.day],
+            "time" : [time_era5.strftime('%H:%M')],
             "data_format": "netcdf",
             "download_format": "unarchived",
             "area": [center_lat+era5_halfres,
@@ -113,14 +116,13 @@ def load_era5_data(filename, data_tar, times_tar, center_lat, center_lon, platfo
         result = client.retrieve("reanalysis-era5-single-levels", request)
         result.download(filename) # type: ignore
 
-    ds_era5_target = xr.open_dataset(filename).isel()
-    
-    sp = ds_era5_target["sp"].isel(        valid_time=valid_time,latitude=0,longitude=0).values / 100 # hPa
-    ozone_DU = ds_era5_target["tco3"].isel(valid_time=valid_time,latitude=0,longitude=0).values / 2.1415e-5  # kg/m² → DU
-    u10 = ds_era5_target["u10"].isel(      valid_time=valid_time,latitude=0,longitude=0).values
-    v10 = ds_era5_target["v10"].isel(      valid_time=valid_time,latitude=0,longitude=0).values
-    u100 = ds_era5_target["u100"].isel(    valid_time=valid_time,latitude=0,longitude=0).values
-    v100 = ds_era5_target["v100"].isel(    valid_time=valid_time,latitude=0,longitude=0).values
+    ds_era5_target = xr.open_dataset(filename).sel(valid_time=np.datetime64(time_era5),latitude=center_lat, longitude=center_lon, method="nearest")
+    sp       = ds_era5_target["sp"].values / 100 # hPa
+    ozone_DU = ds_era5_target["tco3"].values / 2.1415e-5  # kg/m² → DU
+    u10      = ds_era5_target["u10"].values
+    v10      = ds_era5_target["v10"].values
+    u100     = ds_era5_target["u100"].values
+    v100     = ds_era5_target["v100"].values
     ds_era5_target.close()
 
     # Then we get the plume altitude at 500m above the surface.
@@ -147,10 +149,10 @@ def load_era5_data(filename, data_tar, times_tar, center_lat, center_lon, platfo
     # Launch site is at center, so we need the estimated distance to be smaller than half the box.
     if platform == "sd":
         lat_km = (data_tar["y"][0].item()-data_tar["y"][-1].item())/2000
-        lon_km = (data_tar["y"][0].item()-data_tar["y"][-1].item())/2000
+        lon_km = (data_tar["x"][0].item()-data_tar["x"][-1].item())/2000
     else:
-        lat_km = haversine((center_lat, center_lon), (center_lon+0.08, center_lon))
-        lon_km = haversine((center_lat, center_lon), (center_lat, center_lat+0.06))
+        lat_km = haversine((center_lat, center_lon), (center_lat+0.06, center_lon))
+        lon_km = haversine((center_lat, center_lon), (center_lat, center_lon+0.08))
 
     print(f"Grid box is {(lat_km*2):.2f} × {lon_km*2:.2f}")
     if estimated_distance_100 > min([lat_km, lon_km]):
@@ -162,7 +164,11 @@ def load_era5_data(filename, data_tar, times_tar, center_lat, center_lon, platfo
                  "u10":        u10,
                  "v10":        v10,
                  "u100":       u100,
-                 "v100":       v100}
+                 "v100":       v100,
+                 "ws_10":      wind_speed_10,
+                 "wd_10":      wind_direction_10,
+                 "ws_100":     wind_speed_100,
+                 "wd_100":     wind_direction_100,}
     
     return era5_data
         
@@ -175,7 +181,7 @@ def load_xsc_data():
     # bandwidths from https://sentiwiki.copernicus.eu/web/s2-mission
     # xsc data from https://hitran.org/
 
-    xsc_file = "/home/ucfacb0/ARIA/aria_data_analysis/data/NO2_294.0_0.0_15002.0-42002.3_00.xsc.txt"
+    xsc_file = "/home/ucfacb0/ARIA/Level_1_Retrievals/data/NO2_294.0_0.0_15002.0-42002.3_00.xsc.txt"
     xsc = np.loadtxt(xsc_file,max_rows=1,usecols=(1,2,3),dtype=float)
     wavenumbers = np.linspace(xsc[0],xsc[1],int(xsc[2]))
 
