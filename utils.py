@@ -256,7 +256,7 @@ def compute_cloudmask(ind_ref, platform, data_tar, time_tar, time_ref, site_name
             ]).astype(np.float32)
             nodata_px = ~np.isfinite(input_array).all(axis=0)  # catches both inf and nan
             input_array = np.where(np.isfinite(input_array), input_array, 0.0).astype(np.float32)
-        if input_array:
+        if input_array is not None:
             cloud_mask = predict_from_array(input_array)[0] > 0
         else:
             return None
